@@ -1,0 +1,937 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>像素泡泡堂·优化版</title>
+    <style>
+        *{margin:0;padding:0;box-sizing:border-box}
+        body{background:#1a1a1a;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:monospace;color:#ccc}
+        .title{font-size:14px;margin-bottom:4px}
+        #game{position:relative;width:320px;height:320px;border:1px solid #555}
+        canvas{display:block;width:320px;height:320px;background:#eee;image-rendering:pixelated}
+        .overlay{position:absolute;inset:0;background:rgba(0,0,0,.85);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px}
+        .hide{display:none!important}
+        .tip{color:#888;font-size:11px}
+        button{padding:3px 10px;background:#333;color:#ccc;border:1px solid #666;cursor:pointer;font-size:12px}
+        #hud{width:320px;display:flex;justify-content:space-between;padding:4px 6px;font-size:11px;color:#aaa}
+        .life{color:#ff4444; font-weight:bold;}
+    </style>
+</head>
+<body>
+    <div class="title">像素泡泡堂·优化版</div>
+    <div id="hud">
+        <div>命 <span id="life" class="life">3</span></div>
+        <div>敌 <span id="en">3</span></div>
+        <div>力 <span id="pw">1</span></div>
+        <div>速 <span id="sp">1</span></div>
+        <div>爆 <span id="bt">1.0x</span></div>
+        <div>弹 <span id="bm">1</span></div>
+    </div>
+    <div id="game">
+        <canvas id="c" width="320" height="320"></canvas>
+        <div id="start" class="overlay">
+            <div class="tip">WASD/方向键移动 空格放弹</div>
+            <div class="tip">蓝=威力 绿=速度 橙=爆速 紫=炸弹数</div>
+            <button onclick="game.start()">开始</button>
+        </div>
+        <div id="over" class="overlay hide">
+            <div id="msg"></div>
+            <button onclick="game.start()">重开</button>
+        </div>
+    </div>
+
+<script>
+const GRID = 16, TILE = 20;
+const TYPE = {EMPTY:0, WALL:1, BRICK:2, BOMB:3, EXPLOSION:4};
+const ITEM = {POW:1, SPD:2, BTIME:3, BOMB_CNT:4};
+const DIR = [[0,-1],[0,1],[-1,0],[1,0]];
+
+// 核心优化：大幅提升AI攻击性配置
+const CFG = {
+    BOMB:1, POW:1, SPD:1,
+    BASE_BTIME:180,
+    MIN_BTIME:90,
+    MOVE:8,          
+    BOMB_COOLDOWN:2, // 【关键】减少炸弹冷却，增加放弹频率
+    INVINCIBLE:15,
+    REBORN_INV:60,
+    AI_PATH_LEN:50,      // 【关键】增加AI路径长度
+    AI_ESCAPE_LEN:30,    // 减少逃生路径长度，优先攻击
+    AI_CHASE_RANGE:300,  // 【关键】大幅扩大AI追击范围
+    AI_ATTACK_RANGE:80,  // 【关键】缩小攻击触发距离，更近距离精准攻击
+    AI_REACT_SPEED:1,    // 【关键】AI每帧都反应，大幅提升反应速度
+    AI_PREDICT_STEPS:4,  // 【关键】增加预判步数，提前拦截玩家
+    AI_ATTACK_CHANCE:1.0,
+    AI_BREAK_WALL_CHANCE:0.3, // 【关键】降低拆墙优先级，优先攻击玩家
+    ITEM_RATE:0.7,
+    MAX_BOMB:4,
+    MAX_POW:5,
+    MAX_SPD:4,
+    BRICK_RATE:0.65,
+    MAX_LIFE:3,
+    MAX_BFS_ITER:500,    // 【关键】增加BFS迭代次数，路径规划更完整
+    MAX_QUEUE_LEN:500,   // 【关键】增加BFS队列长度
+    TARGET_FPS:60,
+    MAX_BOMBS:10,
+    MAX_EXPLOSIONS:30,
+    MAX_ITEMS:20,
+    AI_DANGER_TIMER:40   // 【关键】降低危险检测阈值，更晚逃生，更敢攻击
+};
+
+class GridObj {
+    constructor(gx, gy) {
+        this.gx = gx; this.gy = gy;
+        this.px = gx * TILE + TILE/2;
+        this.py = gy * TILE + TILE/2;
+    }
+}
+
+class Role extends GridObj {
+    constructor(gx, gy, isAI = false) {
+        super(gx, gy);
+        this.isAI = isAI;
+        this.bombMax = CFG.BOMB;
+        this.bombUsed = 0;
+        this.pow = CFG.POW;
+        this.spd = CFG.SPD;
+        this.bTime = CFG.BASE_BTIME;
+        this.maxLife = CFG.MAX_LIFE;
+        this.life = CFG.MAX_LIFE;
+        this.dead = false;
+        this.inv = 0;
+        this.moveCd = 0;
+        this.bombCd = 0;
+        this.lastDir = [0,0];
+        this.rebornCd = 0;
+    }
+
+    pick(t) {
+        if(t===ITEM.POW) this.pow = Math.min(this.pow+1, CFG.MAX_POW);
+        if(t===ITEM.SPD) this.spd = Math.min(this.spd+1, CFG.MAX_SPD);
+        if(t===ITEM.BTIME) this.bTime = Math.max(CFG.MIN_BTIME, this.bTime-22);
+        if(t===ITEM.BOMB_CNT) this.bombMax = Math.min(this.bombMax+1, CFG.MAX_BOMB);
+    }
+
+    update() {
+        if(this.inv>0) this.inv--;
+        if(this.moveCd>0) this.moveCd--;
+        if(this.bombCd>0) this.bombCd--;
+        if(this.rebornCd>0) this.rebornCd--;
+    }
+
+    canMove(gx, gy, map, bombs, allRoles = []) {
+        if(gx<1 || gx>=GRID-1 || gy<1 || gy>=GRID-1) return false;
+        if(this.moveCd>0 || this.rebornCd>0) return false;
+        if(map[gy][gx]===TYPE.WALL || map[gy][gx]===TYPE.BRICK) return false;
+        
+        let hasBomb = false;
+        for(let i=0; i<bombs.length; i++) {
+            const b = bombs[i];
+            if(b.gx===gx && b.gy===gy && b.timer > 0 && b.owner!==this) {
+                hasBomb = true;
+                break;
+            }
+        }
+        if(hasBomb) return false;
+        
+        for(let i=0; i<allRoles.length; i++) {
+            const r = allRoles[i];
+            if(r !== this && !r.dead && r.rebornCd === 0 && r.gx === gx && r.gy === gy) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    move(gx, gy) {
+        const newDir = [gx - this.gx, gy - this.gy];
+        if(newDir[0] !== 0 || newDir[1] !== 0) {
+            this.lastDir = newDir;
+        }
+        
+        this.gx = gx; this.gy = gy;
+        this.px = gx * TILE + TILE/2;
+        this.py = gy * TILE + TILE/2;
+        this.moveCd = Math.max(1, CFG.MOVE - (this.spd - 1) * 1.5);
+    }
+
+    loseLife() {
+        if(this.inv > 0 || this.dead) return false;
+        
+        this.life--;
+        this.inv = CFG.REBORN_INV;
+        this.rebornCd = 30;
+        
+        if(this.life <= 0) {
+            this.dead = true;
+            return true;
+        }
+        
+        if(!this.isAI) {
+            this.gx = 2;
+            this.gy = 2;
+        } else {
+            const safePoints = [
+                {gx: GRID-3, gy: 2},
+                {gx: 2, gy: GRID-3},
+                {gx: GRID-3, gy: GRID-3}
+            ];
+            const randomPoint = safePoints[Math.floor(Math.random() * safePoints.length)];
+            this.gx = randomPoint.gx;
+            this.gy = randomPoint.gy;
+        }
+        
+        this.px = this.gx * TILE + TILE/2;
+        this.py = this.gy * TILE + TILE/2;
+        return false;
+    }
+}
+
+class Bomb extends GridObj {
+    constructor(gx, gy, owner) {
+        super(gx, gy);
+        this.owner = owner;
+        this.pow = owner.pow;
+        this.timer = owner.bTime;
+        this.radius = TILE * 0.35;
+    }
+
+    update() { 
+        return --this.timer <= 0; 
+    }
+
+    getRange(map) {
+        let r = [{gx:this.gx, gy:this.gy}];
+        DIR.forEach(d=>{
+            for(let i=1;i<=this.pow;i++){
+                let nx = this.gx + d[0]*i;
+                let ny = this.gy + d[1]*i;
+                if(nx<0||nx>=GRID||ny<0||ny>=GRID) break;
+                
+                r.push({gx:nx, gy:ny});
+                
+                if(map[ny][nx]===TYPE.WALL) break;
+                if(map[ny][nx]===TYPE.BRICK) break;
+            }
+        });
+        return r;
+    }
+
+    isCovers(gx, gy, map) {
+        const range = this.getRange(map);
+        for(let i=0; i<range.length; i++) {
+            const p = range[i];
+            if(p.gx === gx && p.gy === gy) return true;
+        }
+        return false;
+    }
+}
+
+class Item extends GridObj {
+    constructor(gx, gy, t) {
+        super(gx, gy);
+        this.t = t; 
+        this.life = 600;
+    }
+
+    update() { 
+        return --this.life <= 0; 
+    }
+}
+
+class Explode extends GridObj {
+    constructor(gx, gy) {
+        super(gx, gy);
+        this.life = 24;
+    }
+
+    update() { 
+        return --this.life <= 0; 
+    }
+}
+
+class Game {
+    constructor(){
+        this.ctx = document.getElementById("c").getContext("2d");
+        this.keys = {}; 
+        this.run = 0; 
+        this.frame = 0;
+        this.animationId = null;
+        this.lastFrameTime = 0;
+        this.deltaTime = 0;
+        
+        window.addEventListener("keydown",e=>{
+            if(!this.run) return;
+            this.keys[e.key.toLowerCase()] = 1;
+            if(e.key === " ") e.preventDefault();
+        });
+        
+        window.addEventListener("keyup",e=>{
+            this.keys[e.key.toLowerCase()] = 0;
+        });
+
+        window.addEventListener("blur", () => {
+            this.keys = {};
+        });
+    }
+
+    map(){
+        this.m = Array(GRID).fill().map((_,y)=>
+            Array(GRID).fill().map((_,x)=>{
+                if(x===0||y===0||x===GRID-1||y===GRID-1) return TYPE.WALL;
+                if(x%2===0&&y%2===0) return TYPE.WALL;
+                return TYPE.EMPTY;
+            })
+        );
+        
+        for(let y=2;y<GRID-2;y++){
+            for(let x=2;x<GRID-2;x++){
+                if((x===2&&y===2) || (x===GRID-3&&y===2) || 
+                   (x===2&&y===GRID-3) || (x===GRID-3&&y===GRID-3)) continue;
+                
+                if(this.m[y][x]===TYPE.EMPTY && Math.random()<CFG.BRICK_RATE) {
+                    this.m[y][x] = TYPE.BRICK;
+                }
+            }
+        }
+    }
+
+    start(){
+        if(this.animationId) {
+            cancelAnimationFrame(this.animationId);
+        }
+        
+        document.getElementById("start").classList.add("hide");
+        document.getElementById("over").classList.add("hide");
+        
+        this.run = 1; 
+        this.frame = 0; 
+        this.lastFrameTime = performance.now();
+        this.map();
+        
+        this.p = new Role(2,2);
+        this.ai = [
+            new Role(GRID-3,2,true),
+            new Role(2,GRID-3,true),
+            new Role(GRID-3,GRID-3,true)
+        ];
+        
+        this.bombs = []; 
+        this.ex = []; 
+        this.items = [];
+        
+        this.ui(); 
+        this.loop();
+    }
+
+    putBomb(r){
+        if(r.dead || r.rebornCd > 0) return;
+        if(r.bombUsed >= r.bombMax || r.bombCd > 0) return;
+        
+        let hasBomb = false;
+        for(let i=0; i<this.bombs.length; i++) {
+            const b = this.bombs[i];
+            if(b.gx===r.gx&&b.gy===r.gy&&b.timer>0) {
+                hasBomb = true;
+                break;
+            }
+        }
+        if(hasBomb) return;
+        
+        if(this.bombs.length >= CFG.MAX_BOMBS) return;
+        
+        this.bombs.push(new Bomb(r.gx, r.gy, r));
+        r.bombUsed++; 
+        r.bombCd = CFG.BOMB_COOLDOWN; 
+        r.inv = CFG.INVINCIBLE;
+    }
+
+    explode(b){
+        b.owner.bombUsed = Math.max(0, b.owner.bombUsed-1);
+        const range = b.getRange(this.m);
+        
+        range.forEach(p=>{
+            if(p.gx<1||p.gy<1||p.gx>=GRID-1||p.gy>=GRID-1) return;
+            
+            if(this.ex.length < CFG.MAX_EXPLOSIONS) {
+                this.ex.push(new Explode(p.gx,p.gy));
+            }
+            
+            if(this.m[p.gy][p.gx]===TYPE.BRICK){
+                this.m[p.gy][p.gx] = TYPE.EMPTY;
+                if(Math.random()<CFG.ITEM_RATE && this.items.length < CFG.MAX_ITEMS){
+                    this.items.push(new Item(p.gx,p.gy,~~(Math.random()*4)+1));
+                }
+            }
+            
+            let cb = null;
+            for(let i=0; i<this.bombs.length; i++) {
+                const x = this.bombs[i];
+                if(x.gx===p.gx&&x.gy===p.gy&&x!==b&&x.timer>12) {
+                    cb = x;
+                    break;
+                }
+            }
+            if(cb) cb.timer = 12;
+        });
+    }
+
+    isDanger(gx,gy, isAI = false){
+        for(let i=0; i<this.ex.length; i++) {
+            const e = this.ex[i];
+            if(e.gx===gx&&e.gy===gy) return true;
+        }
+        
+        const dangerTimer = isAI ? CFG.AI_DANGER_TIMER : 35;
+        for(let i=0; i<this.bombs.length; i++) {
+            const b = this.bombs[i];
+            if(b.timer < dangerTimer && b.isCovers(gx, gy, this.m)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    getDistanceToNearestBomb(gx, gy) {
+        let minDist = Infinity;
+        for(let i=0; i<this.bombs.length; i++) {
+            const b = this.bombs[i];
+            if(b.timer < CFG.AI_DANGER_TIMER) {
+                const dist = Math.hypot(gx - b.gx, gy - b.gy);
+                minDist = Math.min(minDist, dist);
+            }
+        }
+        return minDist === Infinity ? 0 : minDist;
+    }
+
+    bfs(sx,sy,tx,ty,role){
+        const vis = Array(GRID).fill().map(()=>Array(GRID).fill(0));
+        const q = [{x:sx,y:sy,path:[]}]; 
+        vis[sy][sx] = 1;
+        const allRoles = [this.p, ...this.ai];
+        
+        let iterCount = 0;
+        let ptr = 0;
+        
+        while(ptr < q.length && q[ptr].path.length < CFG.AI_PATH_LEN && q.length < CFG.MAX_QUEUE_LEN && iterCount < CFG.MAX_BFS_ITER){
+            iterCount++;
+            const c = q[ptr++];
+            
+            if(c.x === tx && c.y === ty) return c.path;
+            
+            const dirs = [...DIR].sort((a,b)=>{
+                const scoreA = (a[0] * (tx - c.x)) + (a[1] * (ty - c.y));
+                const scoreB = (b[0] * (tx - c.x)) + (b[1] * (ty - c.y));
+                return scoreB - scoreA;
+            });
+            
+            for(let d of dirs){
+                const nx = c.x + d[0];
+                const ny = c.y + d[1];
+                
+                // 【关键】AI攻击时忽略危险检测（仅路径规划阶段），更敢接近玩家
+                if(role.canMove(nx,ny,this.m,this.bombs,allRoles) && !vis[ny][nx] && 
+                   (!role.isAI || !this.isDanger(nx,ny, true) || iterCount < 10)){
+                    vis[ny][nx] = 1; 
+                    q.push({x:nx,y:ny,path:[...c.path,d]});
+                }
+            }
+        }
+        
+        return ptr < q.length ? q[ptr].path : null;
+    }
+
+    escapeBfs(sx,sy,role){
+        const vis = Array(GRID).fill().map(()=>Array(GRID).fill(0));
+        const q = [{x:sx,y:sy,path:[], distance: this.getDistanceToNearestBomb(sx, sy)}]; 
+        vis[sy][sx] = 1;
+        const allRoles = [this.p, ...this.ai];
+        
+        let iterCount = 0;
+        let ptr = 0;
+        let bestEscapePath = null;
+        let maxSafeDistance = 0;
+        
+        while(ptr < q.length && q[ptr].path.length < CFG.AI_ESCAPE_LEN && q.length < CFG.MAX_QUEUE_LEN && iterCount < CFG.MAX_BFS_ITER){
+            iterCount++;
+            const c = q[ptr++];
+            
+            if(!this.isDanger(c.x,c.y, true)) {
+                if(c.distance > maxSafeDistance) {
+                    maxSafeDistance = c.distance;
+                    bestEscapePath = c.path;
+                }
+                if(c.distance >= 3) { // 【关键】降低安全距离要求
+                    return c.path;
+                }
+            }
+            
+            const dirs = [...DIR].sort((a,b)=>{
+                const nx1 = c.x + a[0];
+                const ny1 = c.y + a[1];
+                const dist1 = this.getDistanceToNearestBomb(nx1, ny1);
+                
+                const nx2 = c.x + b[0];
+                const ny2 = c.y + b[1];
+                const dist2 = this.getDistanceToNearestBomb(nx2, ny2);
+                
+                return dist2 - dist1;
+            });
+            
+            for(let d of dirs){
+                const nx = c.x + d[0];
+                const ny = c.y + d[1];
+                
+                if(role.canMove(nx,ny,this.m,this.bombs,allRoles) && !vis[ny][nx]){
+                    vis[ny][nx] = 1; 
+                    const newDist = this.getDistanceToNearestBomb(nx, ny);
+                    q.push({x:nx,y:ny,path:[...c.path,d], distance: newDist});
+                }
+            }
+        }
+        
+        if(bestEscapePath) {
+            return bestEscapePath;
+        }
+        
+        for(let d of DIR){
+            const nx = sx + d[0];
+            const ny = sy + d[1];
+            if(role.canMove(nx,ny,this.m,this.bombs,allRoles) && !this.isDanger(nx,ny, true)){
+                return [d];
+            }
+        }
+        return null;
+    }
+
+    predictTargetPos(target) {
+        let gx = target.gx;
+        let gy = target.gy;
+        
+        // 【关键】优化预判逻辑，考虑玩家可能的变向
+        const possibleDirs = [target.lastDir, [target.lastDir[1], target.lastDir[0]], 
+                             [-target.lastDir[1], -target.lastDir[0]]];
+        
+        // 尝试多种预判方向，选择最优拦截点
+        let bestPredict = {gx, gy, score: 0};
+        
+        for(let dir of possibleDirs) {
+            let currGx = gx;
+            let currGy = gy;
+            let validSteps = 0;
+            
+            for(let i=0; i<CFG.AI_PREDICT_STEPS; i++) {
+                const nx = currGx + dir[0];
+                const ny = currGy + dir[1];
+                
+                if(nx>1 && nx<GRID-2 && ny>1 && ny<GRID-2 && this.m[ny][nx]===TYPE.EMPTY) {
+                    currGx = nx;
+                    currGy = ny;
+                    validSteps++;
+                } else {
+                    break;
+                }
+            }
+            
+            const score = validSteps * 2 - Math.abs(currGx - gx) - Math.abs(currGy - gy);
+            if(score > bestPredict.score) {
+                bestPredict = {gx: currGx, gy: currGy, score};
+            }
+        }
+        
+        return {gx: bestPredict.gx, gy: bestPredict.gy};
+    }
+
+    // 【关键】重写攻击位置查找逻辑，更精准拦截玩家
+    findBestAttackPos(ai, target) {
+        const allRoles = [this.p, ...this.ai];
+        const predictPos = this.predictTargetPos(target);
+        const attackCandidates = [];
+
+        // 1. 优先在玩家移动路径上布置炸弹（拦截）
+        for(let i=1; i<=ai.pow; i++) {
+            // 沿玩家移动方向前i格
+            const gx = predictPos.gx - target.lastDir[0] * i;
+            const gy = predictPos.gy - target.lastDir[1] * i;
+            
+            if(ai.canMove(gx, gy, this.m, this.bombs, allRoles) && !this.isDanger(gx, gy, true)) {
+                const distToTarget = Math.hypot(gx - predictPos.gx, gy - predictPos.gy);
+                attackCandidates.push({gx, gy, dist: distToTarget, type: "intercept"});
+            }
+        }
+
+        // 2. 补充直接攻击位置
+        for(let dx=-2; dx<=2; dx++) {
+            for(let dy=-2; dy<=2; dy++) {
+                const gx = ai.gx + dx;
+                const gy = ai.gy + dy;
+                
+                if(ai.canMove(gx, gy, this.m, this.bombs, allRoles) && !this.isDanger(gx, gy, true)) {
+                    const distToTarget = Math.hypot(gx - predictPos.gx, gy - predictPos.gy);
+                    if(distToTarget <= ai.pow) { // 【关键】炸弹必中范围
+                        attackCandidates.push({gx, gy, dist: distToTarget, type: "direct"});
+                    }
+                }
+            }
+        }
+
+        if(attackCandidates.length) {
+            // 优先拦截位置，其次近距离
+            return attackCandidates.sort((a,b) => {
+                if(a.type === "intercept" && b.type !== "intercept") return -1;
+                if(a.type !== "intercept" && b.type === "intercept") return 1;
+                return a.dist - b.dist;
+            })[0];
+        }
+        return null;
+    }
+    
+    checkBreakWall(ai){
+        const allRoles = [this.p, ...this.ai];
+        if(ai.bombCd > 0 || ai.bombUsed >= ai.bombMax) return false;
+        if(this.isDanger(ai.gx, ai.gy, true)) return false;
+        
+        for(let dx=-1; dx<=1; dx++){
+            for(let dy=-1; dy<=1; dy++){
+                const nx = ai.gx + dx;
+                const ny = ai.gy + dy;
+                if(this.m[ny][nx] === TYPE.BRICK){
+                    const testBomb = new Bomb(ai.gx, ai.gy, ai);
+                    const bombRange = testBomb.getRange(this.m);
+                    const canEscape = DIR.some(d=>{
+                        const nx=ai.gx+d[0], ny=ai.gy+d[1];
+                        return ai.canMove(nx,ny,this.m,this.bombs,allRoles) &&
+                               !bombRange.some(p=>p.gx===nx&&p.gy===ny) &&
+                               !this.isDanger(nx, ny, true);
+                    });
+                    
+                    if(canEscape && Math.random() < CFG.AI_BREAK_WALL_CHANCE){
+                        this.putBomb(ai);
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    // 【核心】重写AI行为逻辑，大幅提升攻击性
+    doAI(ai){
+        if(ai.dead) return;
+        ai.update();
+        
+        const gx = ai.gx; 
+        const gy = ai.gy;
+        const allRoles = [this.p, ...this.ai];
+
+        // 最高优先级：逃生（仅在立即死亡时）
+        if(this.isDanger(gx,gy, true)){
+            const escapePath = this.escapeBfs(gx,gy,ai);
+            if(escapePath && escapePath.length){
+                ai.move(gx + escapePath[0][0], gy + escapePath[0][1]);
+                return;
+            }
+            
+            const safeDirs = DIR.map(d=>{
+                const nx = gx + d[0]; 
+                const ny = gy + d[1];
+                return {
+                    dir: d,
+                    safe: ai.canMove(nx,ny,this.m,this.bombs,allRoles) && !this.isDanger(nx,ny, true),
+                    dist: this.getDistanceToNearestBomb(nx, ny)
+                };
+            }).filter(item => item.safe).sort((a,b) => b.dist - a.dist);
+            
+            if(safeDirs.length) {
+                ai.move(gx + safeDirs[0].dir[0], gy + safeDirs[0].dir[1]);
+            }
+            return;
+        }
+
+        // 【关键】第一优先级：攻击玩家（大幅增强）
+        const mainTarget = this.p; // 只攻击玩家，忽略其他AI
+        if(!mainTarget.dead) {
+            const dist = Math.hypot((mainTarget.gx - gx)*TILE, (mainTarget.gy - gy)*TILE);
+            
+            // 追击逻辑：超远距离追击
+            if(dist < CFG.AI_CHASE_RANGE) {
+                // 近距离直接放炸弹（【关键】降低逃生要求，更敢放弹）
+                if(dist < CFG.AI_ATTACK_RANGE && ai.bombCd === 0) {
+                    const canEscape = DIR.some(d=>{
+                        const nx = gx + d[0]; 
+                        const ny = gy + d[1];
+                        // 【关键】允许AI在爆炸边缘逃生
+                        return ai.canMove(nx,ny,this.m,this.bombs,allRoles) && 
+                               (!this.isDanger(nx, ny, true) || dist < 40);
+                    });
+                    
+                    // 【关键】即使不能完全逃生，近距离也有概率放弹（同归于尽）
+                    if(canEscape || (dist < 40 && Math.random() > 0.3)) {
+                        this.putBomb(ai);
+                        // 放弹后立即移动一步
+                        const dirs = [...DIR].sort(()=>Math.random()-.5);
+                        for(let d of dirs) {
+                            const nx = gx + d[0]; 
+                            const ny = gy + d[1];
+                            if(ai.canMove(nx,ny,this.m,this.bombs,allRoles) && !this.isDanger(nx,ny, true)){
+                                ai.move(nx,ny);
+                                return;
+                            }
+                        }
+                        return;
+                    }
+                }
+                
+                // 找攻击位置并移动（优先拦截）
+                const bestAttackPos = this.findBestAttackPos(ai, mainTarget);
+                if(bestAttackPos) {
+                    const attackPath = this.bfs(gx, gy, bestAttackPos.gx, bestAttackPos.gy, ai);
+                    if(attackPath && attackPath.length){
+                        ai.move(gx + attackPath[0][0], gy + attackPath[0][1]);
+                        return;
+                    }
+                } else if(dist > 80) {
+                    // 【关键】没有攻击位置时，直接向玩家移动
+                    const chasePath = this.bfs(gx, gy, mainTarget.gx, mainTarget.gy, ai);
+                    if(chasePath && chasePath.length) {
+                        ai.move(gx + chasePath[0][0], gy + chasePath[0][1]);
+                        return;
+                    }
+                }
+            }
+        }
+
+        // 低优先级：捡道具（只捡攻击型道具）
+        const availItems = this.items.filter(i=>!this.isDanger(i.gx,i.gy, true) && 
+                                              (i.t===ITEM.POW || i.t===ITEM.BOMB_CNT));
+        if(availItems.length && Math.random() > 0.5){
+            const targetItem = availItems.reduce((a,b)=>
+                Math.hypot(a.gx-gx,a.gy-gy) < Math.hypot(b.gx-gx,b.gy-gy) ? a : b
+            );
+            
+            const itemPath = this.bfs(gx,gy,targetItem.gx,targetItem.gy,ai);
+            if(itemPath && itemPath.length){
+                ai.move(gx + itemPath[0][0], gy + itemPath[0][1]);
+                return;
+            }
+        }
+
+        // 最低优先级：拆墙
+        if(this.checkBreakWall(ai)) return;
+
+        // 随机移动（仅当无其他目标时）
+        if(Math.random() < 0.2){
+            const dirs = [...DIR].sort(()=>Math.random()-.5);
+            for(let d of dirs) {
+                const nx = gx + d[0]; 
+                const ny = gy + d[1];
+                if(ai.canMove(nx,ny,this.m,this.bombs,allRoles) && !this.isDanger(nx,ny, true)){
+                    ai.move(nx,ny);
+                    break;
+                }
+            }
+        }
+    }
+
+    update(timestamp){
+        if(!this.run) return; 
+        this.frame++;
+        
+        this.deltaTime = timestamp - this.lastFrameTime;
+        this.lastFrameTime = timestamp;
+        
+        this.p.update();
+        const allRoles = [this.p, ...this.ai];
+
+        let moveDir = null;
+        if(this.p.moveCd <= 0) {
+            if(this.keys.w||this.keys.arrowup) moveDir = [0,-1];
+            else if(this.keys.s||this.keys.arrowdown) moveDir = [0,1];
+            else if(this.keys.a||this.keys.arrowleft) moveDir = [-1,0];
+            else if(this.keys.d||this.keys.arrowright) moveDir = [1,0];
+        }
+        
+        if(moveDir) {
+            const nx = this.p.gx + moveDir[0];
+            const ny = this.p.gy + moveDir[1];
+            if(this.p.canMove(nx, ny, this.m, this.bombs, allRoles)){
+                this.p.move(nx, ny);
+            }
+        }
+        
+        if(this.keys[' ']) {
+            this.putBomb(this.p);
+            this.keys[' '] = 0;
+        }
+
+        let playerItemIndex = -1;
+        for(let i=0; i<this.items.length; i++) {
+            const item = this.items[i];
+            if(item.gx===this.p.gx&&item.gy===this.p.gy) {
+                playerItemIndex = i;
+                break;
+            }
+        }
+        if(playerItemIndex >= 0){ 
+            this.p.pick(this.items[playerItemIndex].t); 
+            this.items.splice(playerItemIndex, 1);
+            this.ui(); 
+        }
+
+        // 【关键】AI每帧都执行，不再限制频率
+        this.ai.forEach((ai, i) => {
+            if(ai.dead) return;
+            this.doAI(ai);
+        });
+        
+        for(let i=0; i<this.ai.length; i++) {
+            const a = this.ai[i];
+            if(a.dead) continue;
+            
+            let aiItemIndex = -1;
+            for(let j=0; j<this.items.length; j++) {
+                const item = this.items[j];
+                if(item.gx===a.gx&&item.gy===a.gy) {
+                    aiItemIndex = j;
+                    break;
+                }
+            }
+            if(aiItemIndex >= 0){ 
+                a.pick(this.items[aiItemIndex].t); 
+                this.items.splice(aiItemIndex, 1);
+                this.ui(); 
+            }
+        }
+
+        this.bombs = this.bombs.filter(b=>{
+            if(b.update()){ 
+                this.explode(b); 
+                return false; 
+            } 
+            return true;
+        });
+        this.ex = this.ex.filter(e=>!e.update());
+        this.items = this.items.filter(i=>!i.update());
+
+        if(!this.p.dead && this.p.rebornCd === 0 && this.isDanger(this.p.gx,this.p.gy)){
+            const isDead = this.p.loseLife();
+            this.ui();
+            if(isDead) {
+                this.end(0); 
+                return;
+            }
+        }
+        
+        for(let i=0; i<this.ai.length; i++) {
+            const a = this.ai[i];
+            if(a.dead || a.rebornCd > 0) continue;
+            if(this.isDanger(a.gx,a.gy, true)) {
+                a.loseLife();
+            }
+        }
+        
+        this.ai = this.ai.filter(a=>!a.dead);
+        document.getElementById("en").textContent = this.ai.length;
+
+        if(this.ai.length === 0) {
+            this.end(1);
+        }
+    }
+
+    draw(){
+        this.ctx.clearRect(0,0,320,320);
+        
+        for(let y=0;y<GRID;y++){
+            for(let x=0;x<GRID;x++){
+                const t = this.m[y][x];
+                this.ctx.fillStyle = t===TYPE.WALL?"#333":t===TYPE.BRICK?"#888":"#eee";
+                this.ctx.fillRect(x*TILE+1,y*TILE+1,TILE-2,TILE-2);
+            }
+        }
+        
+        this.ctx.fillStyle = "#ff5500";
+        for(let i=0; i<this.ex.length; i++) {
+            const e = this.ex[i];
+            this.ctx.fillRect(e.gx*TILE+1,e.gy*TILE+1,TILE-2,TILE-2);
+        }
+        
+        for(let i=0; i<this.items.length; i++) {
+            const iItem = this.items[i];
+            this.ctx.fillStyle = iItem.t===ITEM.POW?"#4d8df5":
+                                iItem.t===ITEM.SPD?"#36c969":
+                                iItem.t===ITEM.BTIME?"#ff9c41":"#a864e8";
+            this.ctx.fillRect(iItem.gx*TILE+6,iItem.gy*TILE+6,TILE-12,TILE-12);
+        }
+        
+        for(let i=0; i<this.bombs.length; i++) {
+            const b = this.bombs[i];
+            this.ctx.fillStyle = b.timer < 60 ? "#ff3333" : "#222";
+            this.ctx.beginPath();
+            this.ctx.arc(b.px,b.py,b.radius,0,Math.PI*2);
+            this.ctx.fill();
+        }
+        
+        for(let i=0; i<this.ai.length; i++) {
+            const a = this.ai[i];
+            if(!a.dead && a.inv % 4 < 2) {
+                this.ctx.fillStyle = a.life <= 1 ? "#ff3333" : "#777";
+                this.ctx.beginPath();
+                this.ctx.arc(a.px,a.py,8,0,Math.PI*2);
+                this.ctx.fill();
+                this.ctx.fillStyle = "#fff";
+                this.ctx.font = "8px monospace";
+                this.ctx.fillText(a.life, a.px-3, a.py+3);
+            }
+        }
+        
+        if(!this.p.dead && this.p.inv % 4 < 2) {
+            this.ctx.fillStyle = "#fff";
+            this.ctx.fillRect(this.p.px-9,this.p.py-9,18,18);
+            this.ctx.fillStyle = "#111";
+            this.ctx.fillRect(this.p.px-7,this.p.py-7,14,14);
+            this.ctx.fillStyle = "#fff";
+            this.ctx.font = "10px monospace";
+            this.ctx.fillText(this.p.life, this.p.px-4, this.p.py+4);
+        }
+    }
+
+    loop(timestamp = 0){
+        if(!this.run) return;
+        
+        const targetDelta = 1000 / CFG.TARGET_FPS;
+        if(timestamp - this.lastFrameTime >= targetDelta) {
+            this.update(timestamp);
+            this.draw();
+        }
+        
+        this.animationId = requestAnimationFrame((t)=>this.loop(t));
+    }
+
+    ui(){
+        document.getElementById("life").textContent = this.p.life;
+        document.getElementById("en").textContent = this.ai.length;
+        document.getElementById("pw").textContent = this.p.pow;
+        document.getElementById("sp").textContent = this.p.spd;
+        const btRate = (CFG.BASE_BTIME / this.p.bTime).toFixed(1);
+        document.getElementById("bt").textContent = `${btRate}x`;
+        document.getElementById("bm").textContent = this.p.bombMax;
+    }
+
+    end(w){
+        this.run = 0;
+        if(this.animationId) {
+            cancelAnimationFrame(this.animationId);
+            this.animationId = null;
+        }
+        
+        const msg = w ? `胜利！剩余生命：${this.p.life}` : `失败！`;
+        document.getElementById("msg").textContent = msg;
+        document.getElementById("over").classList.remove("hide");
+    }
+}
+
+const game = new Game();
+</script>
+</body>
+</html>
